@@ -23,6 +23,9 @@ jobs:
   android-vm:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    env:
+      ANDROID_USER_HOME: /home/runner/.android
+      ANDROID_AVD_HOME: /home/runner/.android/avd
 
     steps:
       - name: Bersihkan disk & aktifkan KVM
@@ -39,6 +42,7 @@ jobs:
 
       - name: Unduh Android & buat profil Portrait tanpa skin
         run: |
+          mkdir -p "$ANDROID_AVD_HOME"
           ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           SDK_BIN="$ANDROID_HOME/cmdline-tools/latest/bin"
           API=$(echo "${{ inputs.android_version }}" | grep -oE 'API [0-9]+' | awk '{print $2}')
@@ -49,11 +53,14 @@ jobs:
           echo "no" | "$SDK_BIN/avdmanager" create avd \
             -n phone \
             -k "system-images;android-${API};google_apis;x86_64" \
+            -p "$ANDROID_AVD_HOME/phone.avd" \
             --force
 
-          AVD_DIR="$HOME/.android/avd/phone.avd"
-          grep -vE '^(hw\.lcd\.|hw\.ramSize|hw\.cpu\.ncore|hw\.keyboard|hw\.mainKeys|showDeviceFrame|skin\.|disk\.dataPartition)' "$AVD_DIR/config.ini" > "$AVD_DIR/config.ini.tmp" || true
-          mv "$AVD_DIR/config.ini.tmp" "$AVD_DIR/config.ini"
+          AVD_DIR="$ANDROID_AVD_HOME/phone.avd"
+          if [ -f "$AVD_DIR/config.ini" ]; then
+            grep -vE '^(hw\.lcd\.|hw\.ramSize|hw\.cpu\.ncore|hw\.keyboard|hw\.mainKeys|hw\.gpu\.|showDeviceFrame|skin\.|disk\.dataPartition)' "$AVD_DIR/config.ini" > "$AVD_DIR/config.ini.tmp" || true
+            mv "$AVD_DIR/config.ini.tmp" "$AVD_DIR/config.ini"
+          fi
 
           cat << 'EOF' >> "$AVD_DIR/config.ini"
           hw.lcd.width=540
@@ -63,6 +70,8 @@ jobs:
           hw.cpu.ncore=4
           hw.keyboard=yes
           hw.mainKeys=no
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
           showDeviceFrame=no
           skin.dynamic=yes
           skin.name=540x1020
@@ -73,13 +82,13 @@ jobs:
           cat << 'EOF' > "$AVD_DIR/emulator-user.ini"
           window.x = 0
           window.y = 0
+          window.scale = 1
           EOF
 
       - name: Jalankan Android Portrait & buat link Cloudflare
         run: |
           ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
 
-          # Layar virtual portrait pas dengan rasio browser HP
           Xvfb :99 -screen 0 540x1020x24 -ac +extension GLX +render -noreset &
           sleep 2
 
@@ -93,44 +102,4 @@ jobs:
             -accel on > emulator.log 2>&1 &
 
           sleep 5
-          x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o x11vnc.log
-
-          # Redirect otomatis ke noVNC auto-scale (tanpa perlu mode desktop)
-          sudo tee /usr/share/novnc/index.html > /dev/null << 'EOF'
-          <!DOCTYPE html>
-          <html>
-          <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=scale&reconnect=true&show_dot=false">
-          </head>
-          <body style="background:#000;margin:0;"></body>
-          </html>
-          EOF
-
-          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > novnc.log 2>&1 &
-
-          for i in $(seq 1 20); do
-            if curl -s http://localhost:6080 >/dev/null; then break; fi
-            sleep 2
-          done
-
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          ./cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
-
-          TUNNEL_URL=""
-          for i in $(seq 1 20); do
-            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then break; fi
-            sleep 2
-          done
-
-          echo "========================================================"
-          echo "LINK ANDROID VM (PORTRAIT FULLSCREEN):"
-          echo "$TUNNEL_URL"
-          echo "========================================================"
-
-          DURATION="${{ inputs.duration_minutes }}"
-          if [ "$DURATION" -gt 340 ]; then DURATION=340; fi
-          sleep $((DURATION * 60))
+          x11vnc -display :9

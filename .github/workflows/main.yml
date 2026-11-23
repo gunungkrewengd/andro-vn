@@ -26,6 +26,7 @@ jobs:
     env:
       ANDROID_USER_HOME: /home/runner/.android
       ANDROID_AVD_HOME: /home/runner/.android/avd
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Bersihkan disk & aktifkan KVM
@@ -34,11 +35,12 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          sudo chmod 666 /dev/kvm || true
 
-      - name: Pasang paket layar portrait & noVNC
+      - name: Pasang TigerVNC & noVNC
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb x11vnc novnc websockify libpulse0 libxcb-cursor0
+          sudo apt-get install -y -qq tigervnc-standalone-server novnc websockify libpulse0 libxcb-cursor0
 
       - name: Unduh Android & buat profil Portrait tanpa skin
         run: |
@@ -89,10 +91,17 @@ jobs:
         run: |
           ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
 
-          Xvfb :99 -screen 0 540x1020x24 -ac +extension GLX +render -noreset &
-          sleep 2
+          # Jalankan layar virtual + server VNC sekaligus (portrait 540x1020)
+          Xvnc :1 -geometry 540x1020 -depth 24 -rfbport 5900 -SecurityTypes None -AlwaysShared -ac > xvnc.log 2>&1 &
+          sleep 3
 
-          export DISPLAY=:99
+          if ! pgrep -x Xvnc >/dev/null; then
+            echo "Xvnc gagal berjalan:"
+            cat xvnc.log
+            exit 1
+          fi
+
+          export DISPLAY=:1
           "$ANDROID_HOME/emulator/emulator" \
             -avd phone \
             -no-audio \
@@ -101,5 +110,42 @@ jobs:
             -gpu swiftshader_indirect \
             -accel on > emulator.log 2>&1 &
 
-          sleep 5
-          x11vnc -display :9
+          # Redirect otomatis ke noVNC auto-scale (pas di layar HP tanpa situs desktop)
+          sudo tee /usr/share/novnc/index.html > /dev/null << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=scale&reconnect=true&show_dot=false">
+          </head>
+          <body style="background:#000;margin:0;"></body>
+          </html>
+          EOF
+
+          websockify --web=/usr/share/novnc/ 6080 127.0.0.1:5900 > novnc.log 2>&1 &
+
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:6080 >/dev/null; then break; fi
+            sleep 2
+          done
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://127.0.0.1:6080 > tunnel.log 2>&1 &
+
+          TUNNEL_URL=""
+          for i in $(seq 1 20); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+
+          echo "========================================================"
+          echo "LINK ANDROID VM (PORTRAIT FULLSCREEN):"
+          echo "$TUNNEL_URL"
+          echo "========================================================"
+
+          DURATION="${{ inputs.duration_minutes }}"
+          if [ "$DURATION" -gt 340 ]; then DURATION=340; fi
+          sleep $((DURATION * 60))

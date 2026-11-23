@@ -1,4 +1,4 @@
-name: Cloud Android VM
+name: Cloud Android VM (Portrait HP)
 
 on:
   workflow_dispatch:
@@ -6,13 +6,13 @@ on:
       android_version:
         description: 'Versi Android'
         required: true
-        default: '11.0'
+        default: 'Android 11 (API 30)'
         type: choice
         options:
-          - '11.0'
-          - '12.0'
-          - '13.0'
-          - '14.0'
+          - 'Android 11 (API 30)'
+          - 'Android 12 (API 31)'
+          - 'Android 13 (API 33)'
+          - 'Android 14 (API 34)'
       duration_minutes:
         description: 'Durasi aktif dalam menit (maks 340)'
         required: true
@@ -25,33 +25,94 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: Bersihkan disk runner
+      - name: Bersihkan disk & aktifkan KVM
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
-
-      - name: Aktifkan KVM
-        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Jalankan Android VM (noVNC)
+      - name: Pasang paket layar portrait & noVNC
         run: |
-          docker run -d \
-            -p 6080:6080 \
-            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
-            -e WEB_VNC=true \
-            --device /dev/kvm \
-            --name android-vm \
-            budtmo/docker-android:emulator_${{ inputs.android_version }}
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb x11vnc novnc websockify libpulse0 libxcb-cursor0
 
-      - name: Tunggu noVNC siap & buat link akses
+      - name: Unduh Android & buat profil Portrait tanpa skin
         run: |
-          for i in $(seq 1 40); do
-            if curl -s http://localhost:6080 >/dev/null; then
-              break
-            fi
-            sleep 5
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDK_BIN="$ANDROID_HOME/cmdline-tools/latest/bin"
+          API=$(echo "${{ inputs.android_version }}" | grep -oE 'API [0-9]+' | awk '{print $2}')
+
+          yes | "$SDK_BIN/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$SDK_BIN/sdkmanager" "system-images;android-${API};google_apis;x86_64"
+
+          echo "no" | "$SDK_BIN/avdmanager" create avd \
+            -n phone \
+            -k "system-images;android-${API};google_apis;x86_64" \
+            --force
+
+          AVD_DIR="$HOME/.android/avd/phone.avd"
+          grep -vE '^(hw\.lcd\.|hw\.ramSize|hw\.cpu\.ncore|hw\.keyboard|hw\.mainKeys|showDeviceFrame|skin\.|disk\.dataPartition)' "$AVD_DIR/config.ini" > "$AVD_DIR/config.ini.tmp" || true
+          mv "$AVD_DIR/config.ini.tmp" "$AVD_DIR/config.ini"
+
+          cat << 'EOF' >> "$AVD_DIR/config.ini"
+          hw.lcd.width=540
+          hw.lcd.height=1020
+          hw.lcd.density=240
+          hw.ramSize=4096
+          hw.cpu.ncore=4
+          hw.keyboard=yes
+          hw.mainKeys=no
+          showDeviceFrame=no
+          skin.dynamic=yes
+          skin.name=540x1020
+          skin.path=_no_skin
+          disk.dataPartition.size=6144M
+          EOF
+
+          cat << 'EOF' > "$AVD_DIR/emulator-user.ini"
+          window.x = 0
+          window.y = 0
+          EOF
+
+      - name: Jalankan Android Portrait & buat link Cloudflare
+        run: |
+          ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
+          # Layar virtual portrait pas dengan rasio browser HP
+          Xvfb :99 -screen 0 540x1020x24 -ac +extension GLX +render -noreset &
+          sleep 2
+
+          export DISPLAY=:99
+          "$ANDROID_HOME/emulator/emulator" \
+            -avd phone \
+            -no-audio \
+            -no-boot-anim \
+            -no-snapshot \
+            -gpu swiftshader_indirect \
+            -accel on > emulator.log 2>&1 &
+
+          sleep 5
+          x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o x11vnc.log
+
+          # Redirect otomatis ke noVNC auto-scale (tanpa perlu mode desktop)
+          sudo tee /usr/share/novnc/index.html > /dev/null << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <meta http-equiv="refresh" content="0; url=vnc.html?autoconnect=true&resize=scale&reconnect=true&show_dot=false">
+          </head>
+          <body style="background:#000;margin:0;"></body>
+          </html>
+          EOF
+
+          websockify --web=/usr/share/novnc/ 6080 localhost:5900 > novnc.log 2>&1 &
+
+          for i in $(seq 1 20); do
+            if curl -s http://localhost:6080 >/dev/null; then break; fi
+            sleep 2
           done
 
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
@@ -61,14 +122,12 @@ jobs:
           TUNNEL_URL=""
           for i in $(seq 1 20); do
             TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
+            if [ -n "$TUNNEL_URL" ]; then break; fi
             sleep 2
           done
 
           echo "========================================================"
-          echo "LINK ANDROID VM:"
+          echo "LINK ANDROID VM (PORTRAIT FULLSCREEN):"
           echo "$TUNNEL_URL"
           echo "========================================================"
 

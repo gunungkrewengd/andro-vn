@@ -1,0 +1,77 @@
+name: Cloud Android VM
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Versi Android'
+        required: true
+        default: '11.0'
+        type: choice
+        options:
+          - '11.0'
+          - '12.0'
+          - '13.0'
+          - '14.0'
+      duration_minutes:
+        description: 'Durasi aktif dalam menit (maks 340)'
+        required: true
+        default: '340'
+        type: string
+
+jobs:
+  android-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Bersihkan disk runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android
+
+      - name: Aktifkan KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Jalankan Android VM (noVNC)
+        run: |
+          docker run -d \
+            -p 6080:6080 \
+            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
+            -e WEB_VNC=true \
+            --device /dev/kvm \
+            --name android-vm \
+            budtmo/docker-android:emulator_${{ inputs.android_version }}
+
+      - name: Tunggu noVNC siap & buat link akses
+        run: |
+          for i in $(seq 1 40); do
+            if curl -s http://localhost:6080 >/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+
+          TUNNEL_URL=""
+          for i in $(seq 1 20); do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log | head -n 1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          echo "========================================================"
+          echo "LINK ANDROID VM:"
+          echo "$TUNNEL_URL"
+          echo "========================================================"
+
+          DURATION="${{ inputs.duration_minutes }}"
+          if [ "$DURATION" -gt 340 ]; then DURATION=340; fi
+          sleep $((DURATION * 60))
